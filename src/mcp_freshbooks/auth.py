@@ -38,11 +38,30 @@ def get_config() -> dict:
 
 
 def get_auth_url(config: dict) -> str:
-    """Build the OAuth2 authorization URL."""
+    """Build the OAuth2 authorization URL.
+
+    Requests the full set of scopes the package's tool surface needs.
+    Omitting `scope` here causes FreshBooks to issue a token with only
+    `user:profile:read`, which makes every non-identity tool return 403.
+    """
+    scopes = " ".join([
+        "user:profile:read",
+        "user:clients:read", "user:clients:write",
+        "user:invoices:read", "user:invoices:write",
+        "user:expenses:read", "user:expenses:write",
+        "user:payments:read", "user:payments:write",
+        "user:projects:read", "user:projects:write",
+        "user:reports:read",
+        "user:taxes:read",
+        "user:time_entries:read", "user:time_entries:write",
+        "user:estimates:read", "user:estimates:write",
+        "user:billable_items:read",
+    ])
     params = {
         "client_id": config["client_id"],
         "response_type": "code",
         "redirect_uri": config["redirect_uri"],
+        "scope": scopes,
     }
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
