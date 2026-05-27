@@ -391,6 +391,74 @@ async def delete_expense(expense_id: int) -> str:
     return f"Expense {expense_id} deleted."
 
 
+_ALLOWED_RECEIPT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+_MAX_RECEIPT_BYTES = 25 * 1024 * 1024  # 25 MB
+_EXT_FOR_MIME = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+    "image/webp": ".webp", "application/pdf": ".pdf",
+}
+
+
+@mcp.tool()
+@_handle_errors
+async def attach_receipt_to_expense(
+    expense_id: int,
+    receipt_data: str | None = None,
+    mime_type: str | None = None,
+    filename: str | None = None,
+    receipt_url: str | None = None,
+) -> str:
+    """Attach a receipt (image or PDF) to an existing expense.
+
+    Pass EITHER receipt_data (base64-encoded file bytes — use this for Gmail attachments,
+    where the Gmail tool returns the attachment as base64) OR receipt_url (a publicly-fetchable
+    URL — use this for vendor receipt links like Amazon/Stripe).
+
+    For receipt_data, mime_type is required (e.g. 'application/pdf', 'image/jpeg') and
+    filename is recommended. The Gmail message_part metadata includes both.
+
+    Allowed types: image/png, image/jpeg, image/gif, image/webp, application/pdf. Max 25 MB.
+    """
+    import base64
+
+    if (receipt_data is None) == (receipt_url is None):
+        return "Error: Pass exactly one of receipt_data (base64) or receipt_url."
+
+    if receipt_data is not None:
+        if not mime_type:
+            return "Error: mime_type is required when passing receipt_data."
+        try:
+            file_bytes = base64.b64decode(receipt_data, validate=False)
+        except Exception as e:
+            return f"Error: receipt_data is not valid base64 ({e})."
+        mime_type = mime_type.split(";")[0].strip().lower()
+    else:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
+            resp = await http.get(receipt_url)
+            resp.raise_for_status()
+            file_bytes = resp.content
+            mime_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if not filename:
+            url_tail = receipt_url.rsplit("/", 1)[-1].split("?")[0]
+            filename = url_tail if "." in url_tail else None
+
+    if mime_type not in _ALLOWED_RECEIPT_TYPES:
+        return f"Error: Unsupported receipt type '{mime_type}'. Allowed: {sorted(_ALLOWED_RECEIPT_TYPES)}."
+    if len(file_bytes) > _MAX_RECEIPT_BYTES:
+        return f"Error: Receipt is {len(file_bytes)} bytes; limit is {_MAX_RECEIPT_BYTES}."
+    if not filename:
+        filename = f"receipt-{expense_id}{_EXT_FOR_MIME[mime_type]}"
+
+    uploaded = await client.upload_attachment(file_bytes, filename, mime_type)
+    await client.accounting_update(
+        "expenses/expenses",
+        expense_id,
+        "expense",
+        {"attachment": {"jwt": uploaded["jwt"], "media_type": uploaded["media_type"]}},
+    )
+    return f"Receipt attached to expense {expense_id} ({filename}, {len(file_bytes)} bytes, {mime_type})."
+
+
 # ─── Payment Tools ───
 
 @mcp.tool()

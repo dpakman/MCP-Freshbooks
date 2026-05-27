@@ -8,6 +8,7 @@ from .auth import get_config, get_valid_token, get_identity
 
 ACCOUNTING_BASE = "https://api.freshbooks.com/accounting/account"
 PROJECTS_BASE = "https://api.freshbooks.com/projects/business"
+UPLOADS_BASE = "https://api.freshbooks.com/uploads/account"
 
 _identity_cache: dict | None = None
 
@@ -189,6 +190,20 @@ async def projects_delete(resource: str, resource_id: int | str) -> bool:
         resp = await client.delete(url, headers=headers)
         resp.raise_for_status()
         return True
+
+
+async def upload_attachment(file_bytes: bytes, filename: str, mime_type: str) -> dict:
+    """Upload a file to FreshBooks' attachments endpoint. Returns dict with jwt + media_type."""
+    account_id, _ = await get_ids()
+    config = get_config()
+    token = get_valid_token(config)
+    url = f"{UPLOADS_BASE}/{account_id}/attachments"
+    headers = {"Authorization": f"Bearer {token}"}
+    files = {"content": (filename, file_bytes, mime_type)}
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(url, headers=headers, files=files)
+        resp.raise_for_status()
+        return resp.json()["attachment"]
 
 
 async def get_report(report_type: str, params: dict | None = None) -> dict:

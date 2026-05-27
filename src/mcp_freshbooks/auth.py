@@ -56,6 +56,7 @@ def get_auth_url(config: dict) -> str:
         "user:time_entries:read", "user:time_entries:write",
         "user:estimates:read", "user:estimates:write",
         "user:billable_items:read",
+        "user:uploads:read", "user:uploads:write",
     ])
     params = {
         "client_id": config["client_id"],
