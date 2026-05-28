@@ -3,6 +3,7 @@
 import json
 import functools
 import threading
+from decimal import Decimal, InvalidOperation
 from mcp.server.fastmcp import FastMCP
 
 import httpx
@@ -139,7 +140,7 @@ async def list_invoices(
 @_handle_errors
 async def get_invoice(invoice_id: int) -> str:
     """Get full details of a specific invoice including line items."""
-    result = await client.accounting_get("invoices/invoices", invoice_id)
+    result = await client.accounting_get("invoices/invoices", invoice_id, includes=["lines"])
     return _fmt(result.get("invoice", result))
 
 
@@ -760,6 +761,212 @@ async def get_payments_collected(start_date: str, end_date: str) -> str:
     """Get payments collected report for a date range. Shows cash flow from client payments."""
     result = await client.get_report("payments_collected", {"start_date": start_date, "end_date": end_date})
     return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_invoice_details_report(start_date: str, end_date: str) -> str:
+    """Pull the invoice_details report — every invoice with line-level detail in one call for a date range. Dates as YYYY-MM-DD."""
+    result = await client.get_report("invoice_details", {"start_date": start_date, "end_date": end_date})
+    return _fmt(result)
+
+
+def _dec(val) -> Decimal:
+    """Parse a FreshBooks amount field (string or dict like {'amount': '12.34'}) to Decimal."""
+    if val is None:
+        return Decimal("0")
+    if isinstance(val, dict):
+        val = val.get("amount", "0")
+    try:
+        return Decimal(str(val))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
+async def _list_invoices_in_range(start_date: str, end_date: str) -> list[dict]:
+    """Walk pagination and return all non-draft, non-deleted invoices created in [start_date, end_date]."""
+    invoices: list[dict] = []
+    page = 1
+    while True:
+        result = await client.accounting_list(
+            "invoices/invoices",
+            page=page,
+            per_page=100,
+            filters={"date_min": start_date, "date_max": end_date},
+            includes=["lines"],
+        )
+        batch = result.get("invoices", [])
+        invoices.extend(batch)
+        pages = result.get("pages", 1) or 1
+        if page >= pages or not batch:
+            break
+        page += 1
+    # Defensive client-side filter: keep active (vis_state == 0) and skip drafts.
+    return [
+        inv for inv in invoices
+        if inv.get("vis_state", 0) == 0
+        and inv.get("display_status") != "draft"
+    ]
+
+
+def _line_taxes(line: dict) -> list[tuple[str, Decimal]]:
+    """Return list of (tax_name, tax_percentage) for a line — only entries where both fields are set."""
+    out = []
+    for n, a in (("taxName1", "taxAmount1"), ("taxName2", "taxAmount2")):
+        name = line.get(n)
+        amount = line.get(a)
+        if name and amount not in (None, "", 0, "0"):
+            out.append((name, _dec(amount)))
+    return out
+
+
+@mcp.tool()
+@_handle_errors
+async def find_invoices_missing_tax(
+    start_date: str,
+    end_date: str,
+    expected_tax_name: str | None = None,
+) -> str:
+    """Flag invoices in a date range where no line has any tax applied (or, if expected_tax_name is given,
+    invoices where no line carries that specific tax name). Useful for catching billing errors before
+    sales tax filing. Dates as YYYY-MM-DD."""
+    invoices = await _list_invoices_in_range(start_date, end_date)
+    flagged = []
+    for inv in invoices:
+        lines = inv.get("lines", [])
+        if not lines:
+            continue
+        if expected_tax_name:
+            has_expected = any(
+                name == expected_tax_name
+                for line in lines
+                for name, _ in _line_taxes(line)
+            )
+            if has_expected:
+                continue
+            reason = f"missing '{expected_tax_name}' on every line"
+        else:
+            has_any_tax = any(_line_taxes(line) for line in lines)
+            if has_any_tax:
+                continue
+            reason = "no tax on any line"
+        flagged.append({
+            "id": inv.get("id"),
+            "invoice_number": inv.get("invoice_number"),
+            "create_date": inv.get("create_date"),
+            "customerid": inv.get("customerid"),
+            "amount": inv.get("amount"),
+            "display_status": inv.get("display_status"),
+            "reason": reason,
+        })
+    if not flagged:
+        scope = f"with '{expected_tax_name}'" if expected_tax_name else "with any tax"
+        return f"All {len(invoices)} invoices in {start_date} – {end_date} are tagged {scope}. No issues found."
+    lines_out = [f"Found {len(flagged)} of {len(invoices)} invoices missing expected tax in {start_date} – {end_date}:\n"]
+    for f in flagged:
+        amt = f.get("amount", {})
+        amt_str = f"${amt.get('amount', '?')} {amt.get('code', '')}".strip() if isinstance(amt, dict) else str(amt)
+        lines_out.append(
+            f"  #{f['invoice_number']} (id {f['id']}) — {f['create_date']} — {amt_str} — {f['display_status']} — {f['reason']}"
+        )
+    return "\n".join(lines_out)
+
+
+@mcp.tool()
+@_handle_errors
+async def verify_tax_summary(start_date: str, end_date: str) -> str:
+    """Recompute the sales-tax-summary from every invoice's line items and compare to what the
+    FreshBooks taxsummary report says. Returns a side-by-side per-tax breakdown plus exempt sales,
+    and flags any divergence between recomputed totals and reported totals. Dates as YYYY-MM-DD."""
+    report = await client.get_report("taxsummary", {"start_date": start_date, "end_date": end_date})
+    invoices = await _list_invoices_in_range(start_date, end_date)
+
+    gross_invoiced = Decimal("0")
+    per_tax_taxable: dict[str, Decimal] = {}
+    per_tax_collected: dict[str, Decimal] = {}
+    exempt = Decimal("0")
+    contributing_invoice_ids_by_tax: dict[str, list[int]] = {}
+
+    for inv in invoices:
+        for line in inv.get("lines", []):
+            subtotal = _dec(line.get("amount"))
+            if subtotal == 0:
+                qty = _dec(line.get("qty"))
+                unit = _dec(line.get("unit_cost"))
+                subtotal = qty * unit
+            gross_invoiced += subtotal
+            line_taxes = _line_taxes(line)
+            if not line_taxes:
+                exempt += subtotal
+                continue
+            for name, pct in line_taxes:
+                per_tax_taxable[name] = per_tax_taxable.get(name, Decimal("0")) + subtotal
+                per_tax_collected[name] = per_tax_collected.get(name, Decimal("0")) + (subtotal * pct / Decimal("100"))
+                contributing_invoice_ids_by_tax.setdefault(name, []).append(inv.get("id"))
+
+    reported_by_name: dict[str, dict] = {}
+    for t in report.get("taxes", []):
+        reported_by_name[t.get("tax_name", "")] = {
+            "taxable_amount_collected": _dec(t.get("taxable_amount_collected")),
+            "tax_collected": _dec(t.get("tax_collected")),
+        }
+    reported_total_invoiced = _dec(report.get("total_invoiced"))
+
+    out = [
+        f"Sales Tax Verification: {start_date} – {end_date}",
+        f"Invoices considered: {len(invoices)} (non-draft, vis_state=0)",
+        "",
+        f"{'Metric':<40} {'Reported':>15} {'Recomputed':>15} {'Δ':>12}",
+        "-" * 84,
+    ]
+
+    def _row(label: str, reported: Decimal, recomputed: Decimal):
+        delta = recomputed - reported
+        flag = "" if abs(delta) < Decimal("0.01") else " ⚠"
+        return f"{label:<40} {str(reported):>15} {str(recomputed):>15} {str(delta):>12}{flag}"
+
+    out.append(_row("Gross invoiced", reported_total_invoiced, gross_invoiced))
+    all_tax_names = sorted(set(per_tax_taxable) | set(reported_by_name))
+    for name in all_tax_names:
+        rep = reported_by_name.get(name, {})
+        out.append(_row(
+            f"  {name}: taxable sales",
+            rep.get("taxable_amount_collected", Decimal("0")),
+            per_tax_taxable.get(name, Decimal("0")),
+        ))
+        out.append(_row(
+            f"  {name}: tax collected",
+            rep.get("tax_collected", Decimal("0")),
+            per_tax_collected.get(name, Decimal("0")),
+        ))
+    out.append(_row("Exempt sales (no tax on line)", Decimal("0"), exempt))
+    out.append("")
+    out.append(f"Note: 'Exempt' is computed as the sum of line subtotals with NO taxName1 or taxName2 set. "
+               f"FreshBooks's taxsummary does not break this out directly — compare gross_invoiced to "
+               f"the sum of taxable sales to cross-check.")
+
+    discrepancies = []
+    if abs(gross_invoiced - reported_total_invoiced) >= Decimal("0.01"):
+        discrepancies.append("gross_invoiced")
+    for name in all_tax_names:
+        rep = reported_by_name.get(name, {})
+        if abs(per_tax_taxable.get(name, Decimal("0")) - rep.get("taxable_amount_collected", Decimal("0"))) >= Decimal("0.01"):
+            discrepancies.append(f"{name} taxable")
+        if abs(per_tax_collected.get(name, Decimal("0")) - rep.get("tax_collected", Decimal("0"))) >= Decimal("0.01"):
+            discrepancies.append(f"{name} collected")
+
+    if discrepancies:
+        out.append("")
+        out.append(f"⚠ Discrepancies found in: {', '.join(discrepancies)}")
+        out.append("Contributing invoice IDs by tax (use get_invoice to drill in):")
+        for name, ids in contributing_invoice_ids_by_tax.items():
+            unique_ids = sorted(set(ids))
+            out.append(f"  {name}: {unique_ids}")
+    else:
+        out.append("")
+        out.append("✓ Recomputed totals match the FreshBooks taxsummary report within $0.01.")
+
+    return "\n".join(out)
 
 
 # ─── Item Tools ───

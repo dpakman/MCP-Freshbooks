@@ -83,13 +83,16 @@ async def accounting_list(
         return resp.json()["response"]["result"]
 
 
-async def accounting_get(resource: str, resource_id: int | str) -> dict:
+async def accounting_get(resource: str, resource_id: int | str, includes: list[str] | None = None) -> dict:
     """Get a single accounting resource."""
     account_id, _ = await get_ids()
     url = f"{ACCOUNTING_BASE}/{account_id}/{resource}/{resource_id}"
+    params: dict[str, Any] = {}
+    if includes:
+        params["include[]"] = list(includes)
     headers = await _get_headers()
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.get(url, headers=headers, params=params)
         resp.raise_for_status()
         return resp.json()["response"]["result"]
 
