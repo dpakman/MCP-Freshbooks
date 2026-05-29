@@ -733,9 +733,16 @@ async def get_profit_loss(start_date: str, end_date: str) -> str:
 
 @mcp.tool()
 @_handle_errors
-async def get_tax_summary(start_date: str, end_date: str) -> str:
-    """Get tax summary report for a date range. Useful for quarterly estimated tax payments."""
-    result = await client.get_report("taxsummary", {"start_date": start_date, "end_date": end_date})
+async def get_tax_summary(start_date: str, end_date: str, cash_based: bool = False) -> str:
+    """Get tax summary report for a date range. cash_based=True recognizes tax on PAYMENT date
+    (matches what state sales-tax filings — NY ST-100, MA ST-9, CT OS-114 — actually want).
+    Default False = accrual (invoice-creation date)."""
+    params = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "cash_based": "true" if cash_based else "false",
+    }
+    result = await client.get_report("taxsummary", params)
     return _fmt(result)
 
 
@@ -874,14 +881,23 @@ async def find_invoices_missing_tax(
 
 @mcp.tool()
 @_handle_errors
-async def verify_tax_summary(start_date: str, end_date: str) -> str:
-    """Recompute the sales-tax-summary from every invoice's line items and compare to what the
-    FreshBooks taxsummary report says. Returns a side-by-side per-tax breakdown plus exempt sales,
-    and flags any divergence between recomputed totals and reported totals. Dates as YYYY-MM-DD."""
-    report = await client.get_report("taxsummary", {"start_date": start_date, "end_date": end_date})
+async def verify_tax_summary(start_date: str, end_date: str, cash_based: bool = False) -> str:
+    """Recompute the sales-tax-summary from every invoice's line items and compare to FreshBooks's
+    taxsummary report. cash_based=True asks FreshBooks for payment-date recognition (what NY ST-100,
+    MA ST-9, CT OS-114 actually want); default False = accrual. Returns a side-by-side per-tax
+    breakdown plus exempt sales, and flags any divergence. Dates as YYYY-MM-DD."""
+    params = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "cash_based": "true" if cash_based else "false",
+    }
+    raw = await client.get_report("taxsummary", params)
+    # FreshBooks wraps the report under a "taxsummary" key. Unwrap defensively (also handles
+    # any future flattening on FreshBooks's side).
+    report = raw.get("taxsummary", raw) if isinstance(raw, dict) else {}
     invoices = await _list_invoices_in_range(start_date, end_date)
 
-    gross_invoiced = Decimal("0")
+    gross_pretax = Decimal("0")
     per_tax_taxable: dict[str, Decimal] = {}
     per_tax_collected: dict[str, Decimal] = {}
     exempt = Decimal("0")
@@ -894,7 +910,7 @@ async def verify_tax_summary(start_date: str, end_date: str) -> str:
                 qty = _dec(line.get("qty"))
                 unit = _dec(line.get("unit_cost"))
                 subtotal = qty * unit
-            gross_invoiced += subtotal
+            gross_pretax += subtotal
             line_taxes = _line_taxes(line)
             if not line_taxes:
                 exempt += subtotal
@@ -904,34 +920,43 @@ async def verify_tax_summary(start_date: str, end_date: str) -> str:
                 per_tax_collected[name] = per_tax_collected.get(name, Decimal("0")) + (subtotal * pct / Decimal("100"))
                 contributing_invoice_ids_by_tax.setdefault(name, []).append(inv.get("id"))
 
+    total_tax_recomputed = sum(per_tax_collected.values(), Decimal("0"))
+    invoice_total_recomputed = gross_pretax + total_tax_recomputed
+
     reported_by_name: dict[str, dict] = {}
     for t in report.get("taxes", []):
-        reported_by_name[t.get("tax_name", "")] = {
-            "taxable_amount_collected": _dec(t.get("taxable_amount_collected")),
+        name = t.get("tax_name", "")
+        # Prefer net_taxable_amount (FreshBooks's primary taxable basis); fall back to
+        # taxable_amount_collected if the response uses the older shape.
+        net_taxable = t.get("net_taxable_amount") if t.get("net_taxable_amount") is not None else t.get("taxable_amount_collected")
+        reported_by_name[name] = {
+            "taxable_amount": _dec(net_taxable),
             "tax_collected": _dec(t.get("tax_collected")),
         }
     reported_total_invoiced = _dec(report.get("total_invoiced"))
 
+    basis = "cash" if cash_based else "accrual"
     out = [
-        f"Sales Tax Verification: {start_date} – {end_date}",
-        f"Invoices considered: {len(invoices)} (non-draft, vis_state=0)",
+        f"Sales Tax Verification: {start_date} – {end_date}  (basis: {basis})",
+        f"Invoices considered: {len(invoices)} (non-draft, vis_state=0; filtered by create_date)",
         "",
         f"{'Metric':<40} {'Reported':>15} {'Recomputed':>15} {'Δ':>12}",
         "-" * 84,
     ]
 
-    def _row(label: str, reported: Decimal, recomputed: Decimal):
+    def _row(label: str, reported: Decimal, recomputed: Decimal, *, flag: bool = True) -> str:
         delta = recomputed - reported
-        flag = "" if abs(delta) < Decimal("0.01") else " ⚠"
-        return f"{label:<40} {str(reported):>15} {str(recomputed):>15} {str(delta):>12}{flag}"
+        marker = " ⚠" if (flag and abs(delta) >= Decimal("0.01")) else ""
+        return f"{label:<40} {str(reported):>15} {str(recomputed):>15} {str(delta):>12}{marker}"
 
-    out.append(_row("Gross invoiced", reported_total_invoiced, gross_invoiced))
+    out.append(_row("Invoice total (incl. tax)", reported_total_invoiced, invoice_total_recomputed))
+    out.append(f"{'  └─ Pre-tax line subtotal':<40} {'':>15} {str(gross_pretax):>15}")
     all_tax_names = sorted(set(per_tax_taxable) | set(reported_by_name))
     for name in all_tax_names:
         rep = reported_by_name.get(name, {})
         out.append(_row(
             f"  {name}: taxable sales",
-            rep.get("taxable_amount_collected", Decimal("0")),
+            rep.get("taxable_amount", Decimal("0")),
             per_tax_taxable.get(name, Decimal("0")),
         ))
         out.append(_row(
@@ -939,25 +964,27 @@ async def verify_tax_summary(start_date: str, end_date: str) -> str:
             rep.get("tax_collected", Decimal("0")),
             per_tax_collected.get(name, Decimal("0")),
         ))
-    out.append(_row("Exempt sales (no tax on line)", Decimal("0"), exempt))
-    out.append("")
-    out.append(f"Note: 'Exempt' is computed as the sum of line subtotals with NO taxName1 or taxName2 set. "
-               f"FreshBooks's taxsummary does not break this out directly — compare gross_invoiced to "
-               f"the sum of taxable sales to cross-check.")
+    out.append(_row("Untaxed line subtotal (incl. discounts)", Decimal("0"), exempt, flag=False))
 
     discrepancies = []
-    if abs(gross_invoiced - reported_total_invoiced) >= Decimal("0.01"):
-        discrepancies.append("gross_invoiced")
+    if abs(invoice_total_recomputed - reported_total_invoiced) >= Decimal("0.01"):
+        discrepancies.append("invoice_total")
     for name in all_tax_names:
         rep = reported_by_name.get(name, {})
-        if abs(per_tax_taxable.get(name, Decimal("0")) - rep.get("taxable_amount_collected", Decimal("0"))) >= Decimal("0.01"):
+        if abs(per_tax_taxable.get(name, Decimal("0")) - rep.get("taxable_amount", Decimal("0"))) >= Decimal("0.01"):
             discrepancies.append(f"{name} taxable")
         if abs(per_tax_collected.get(name, Decimal("0")) - rep.get("tax_collected", Decimal("0"))) >= Decimal("0.01"):
             discrepancies.append(f"{name} collected")
 
+    if cash_based:
+        out.append("")
+        out.append("ℹ cash_based=True: the Reported column reflects payment-date recognition,")
+        out.append("  but the Recomputed column walks invoices by CREATE date. A divergence may simply")
+        out.append("  indicate timing — invoices issued in one period and paid in another.")
+
     if discrepancies:
         out.append("")
-        out.append(f"⚠ Discrepancies found in: {', '.join(discrepancies)}")
+        out.append(f"⚠ Discrepancies in: {', '.join(discrepancies)}")
         out.append("Contributing invoice IDs by tax (use get_invoice to drill in):")
         for name, ids in contributing_invoice_ids_by_tax.items():
             unique_ids = sorted(set(ids))
