@@ -57,6 +57,16 @@ def get_auth_url(config: dict) -> str:
         "user:estimates:read", "user:estimates:write",
         "user:billable_items:read",
         "user:uploads:read", "user:uploads:write",
+        # Accounting / reconciliation (added v0.3.0, scopes corrected v0.3.1 against live
+        # insufficient_scope errors). Requesting these requires a re-authentication;
+        # existing tokens keep working for everything else.
+        "user:account:read",  # ledger_accounts + general_ledger / trial_balance / account_entry_details reports
+        "user:journal_entries:read", "user:journal_entries:write",
+        "user:bills:read", "user:bills:write",
+        "user:bill_payments:read", "user:bill_payments:write",
+        "user:bill_vendors:read", "user:bill_vendors:write",
+        "user:credit_notes:read", "user:credit_notes:write",
+        "user:other_income:read", "user:other_income:write",
     ])
     params = {
         "client_id": config["client_id"],
@@ -133,6 +143,7 @@ def get_identity(access_token: str) -> dict:
         "last_name": data.get("last_name", ""),
         "account_id": biz["account_id"],
         "business_id": biz["id"],
+        "business_uuid": biz.get("business_uuid", ""),
         "business_name": biz.get("name", ""),
     }
 

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-freshbooks"
-version = "0.2.0"
-description = "Production-grade MCP server for FreshBooks — 53 tools for invoices, clients, expenses, payments, time tracking, projects, estimates, reports, and smart workflows."
+version = "0.3.2"
+description = "Production-grade MCP server for FreshBooks — invoices, clients, expenses, payments, time tracking, projects, estimates, reports, bank reconciliation, accounts payable, and smart workflows."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

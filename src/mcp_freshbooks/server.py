@@ -1,9 +1,11 @@
-"""MCP server for FreshBooks — 53 tools for accounting, invoicing, and business management."""
+"""MCP server for FreshBooks — accounting, invoicing, reconciliation, and business management."""
 
 import json
+import re
 import functools
 import threading
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
 import httpx
@@ -12,7 +14,7 @@ from . import auth, client
 
 mcp = FastMCP(
     "freshbooks",
-    instructions="Production-grade MCP server for FreshBooks. Manage invoices, clients, expenses, payments, time tracking, projects, estimates, and reports.",
+    instructions="Production-grade MCP server for FreshBooks. Manage invoices, clients, expenses, payments, time tracking, projects, estimates, and reports. Bank reconciliation: use list_ledger_accounts to find the bank/cash account UUID, get_account_ledger_entries for the book-side ledger to compare against a bank statement, and create_journal_entry to post adjusting entries. AP and non-invoice cash: bills, bill_payments, vendors, other_income, credit_notes.",
 )
 
 
@@ -52,6 +54,17 @@ def _handle_errors(func):
             return await func(*args, **kwargs)
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
+            text = e.response.text or ""
+            # FreshBooks reports a missing OAuth scope as insufficient_scope (sometimes wrapped
+            # in a 400 "Invalid json data received" or a 403). Surface the required scope so it's
+            # actionable rather than masking it as a generic "paid plan" error.
+            if "insufficient_scope" in text:
+                m = re.search(r"Required:\s*(\[[^\]]*\])", text)
+                needed = m.group(1) if m else "additional scope(s)"
+                return (
+                    f"Error: Insufficient OAuth scope (HTTP {status}). This tool requires {needed}, "
+                    f"which the current token lacks. Re-run freshbooks_authenticate to grant it."
+                )
             if status == 403:
                 return f"Error: Access denied (HTTP 403). This feature may require a paid FreshBooks plan."
             if status == 404:
@@ -78,20 +91,33 @@ def _handle_errors(func):
 
 @mcp.tool()
 def freshbooks_authenticate() -> str:
-    """Start FreshBooks OAuth2 authentication. Returns a URL to open in your browser. After authorizing, tokens are saved automatically."""
-    config = auth.get_config()
+    """Start FreshBooks OAuth2 authentication. Returns a URL to authorize in your browser.
+
+    For a local redirect URI (localhost) a callback server captures the code automatically.
+    For a hosted redirect URI, authorize then paste the `code` into freshbooks_authenticate_with_code."""
+    try:
+        config = auth.get_config()
+    except ValueError as e:
+        return f"Error: {e}"
     url = auth.get_auth_url(config)
-    port = int(config["redirect_uri"].split(":")[-1].split("/")[0])
+    parsed = urlparse(config["redirect_uri"])
 
-    def _run_server():
-        auth.start_callback_server(config, port)
+    if parsed.hostname in ("localhost", "127.0.0.1") and parsed.port:
+        threading.Thread(
+            target=lambda: auth.start_callback_server(config, parsed.port), daemon=True
+        ).start()
+        return (
+            f"Open this URL in your browser to authorize:\n\n{url}\n\n"
+            f"Waiting for the callback on localhost:{parsed.port}… tokens save automatically once you authorize."
+        )
 
-    thread = threading.Thread(target=_run_server, daemon=True)
-    thread.start()
-
+    # Hosted / non-localhost redirect: no local callback is reachable, so use the manual code flow.
     return (
-        f"Open this URL in your browser to authorize:\n\n{url}\n\n"
-        f"Waiting for callback on localhost:{port}..."
+        "Open this URL in your browser and authorize (log in as the FreshBooks account whose books "
+        f"this server manages):\n\n{url}\n\n"
+        f"FreshBooks will redirect to {config['redirect_uri']}?code=… — that page will likely show a "
+        "404, which is expected. Copy the `code` value from the address bar and call "
+        'freshbooks_authenticate_with_code(code="…") to finish. The code expires in a few minutes.'
     )
 
 
@@ -1298,6 +1324,288 @@ async def client_summary(client_id: int) -> str:
                 f"${inv.get('outstanding', {}).get('amount', '0')} due {inv.get('due_date', 'N/A')}"
             )
     return "\n".join(lines)
+
+
+# ─── Accounting / Reconciliation Tools ───
+
+def _unwrap_report(resp: dict, key: str) -> dict:
+    """Pull <key> out of a report response, tolerating the response.result wrapper or its absence."""
+    result = resp.get("response", {}).get("result", resp)
+    if isinstance(result, dict):
+        return result.get(key, result)
+    return resp
+
+
+def _normalize_je_detail(entry: dict) -> dict:
+    """Turn a friendly {account_id, amount, type} entry into a FreshBooks journal-entry detail.
+
+    - type: accepts 'debit'/'credit' (any case) or the full 'TYPE_DEBIT'/'TYPE_CREDIT'.
+    - amount: a number/string becomes {'amount': '<value>'}; a dict is passed through
+      (use a dict to set currency, e.g. {'amount': '100.00', 'code': 'USD'}).
+    """
+    t = str(entry.get("type", "")).upper()
+    if not t.startswith("TYPE_"):
+        t = f"TYPE_{t}"
+    amount = entry.get("amount")
+    if not isinstance(amount, dict):
+        amount = {"amount": str(amount)}
+    return {"accountId": entry["account_id"], "amount": amount, "type": t}
+
+
+def _build_manual_journal_entry(
+    name: str,
+    entries: list[dict],
+    date: str | None,
+    description: str | None,
+    number: str | None,
+    entry_id: str | None = None,
+) -> dict:
+    """Assemble the manualJournalEntry payload. Debits must equal credits (FreshBooks enforces this)."""
+    date = date or _today()
+    y, m, d = (int(p) for p in date.split("-"))
+    mje: dict = {
+        "userEnteredDate": {"year": y, "month": m, "day": d},
+        "name": name,
+        "details": [_normalize_je_detail(e) for e in entries],
+    }
+    if number is not None:
+        mje["journalEntryNumber"] = number
+    if description is not None:
+        mje["description"] = description
+    if entry_id is not None:
+        mje["id"] = entry_id
+    return {"manualJournalEntry": mje}
+
+
+@mcp.tool()
+@_handle_errors
+async def list_ledger_accounts(page: int = 1, per_page: int = 100) -> str:
+    """List the chart of accounts (ledger accounts). Returns each account's uuid, name, number, type
+    (asset/liability/equity/income/expense), and sub_type. To start a bank reconciliation, find the
+    bank account here (sub_type "Cash & Bank") and use its uuid with get_account_ledger_entries."""
+    resp = await client.businesses_get("ledger_accounts/accounts", {"page": page, "per_page": min(per_page, 100)})
+    return _fmt(resp.get("data", resp))
+
+
+@mcp.tool()
+@_handle_errors
+async def get_account_ledger_entries(
+    account_uuid: str,
+    start_date: str,
+    end_date: str,
+    include_children: bool = False,
+) -> str:
+    """Core reconciliation tool. Returns the book-side ledger entries for one account (by uuid, from
+    list_ledger_accounts) over a date range, each with debit/credit and a running balance — compare
+    these line-by-line against the bank statement. Dates as YYYY-MM-DD."""
+    params = {
+        "use_ledger_entries": "true",
+        "start_date": start_date,
+        "end_date": end_date,
+        "include_children": "true" if include_children else "false",
+    }
+    resp = await client.businesses_get(f"reports/account_entry_details/{account_uuid}", params)
+    return _fmt(_unwrap_report(resp, "account_entry_details"))
+
+
+@mcp.tool()
+@_handle_errors
+async def get_general_ledger(start_date: str, end_date: str, account_uuid: str | None = None) -> str:
+    """Get the General Ledger report for a date range (all accounts, or one account via account_uuid).
+    Dates as YYYY-MM-DD."""
+    params: dict = {"start_date": start_date, "end_date": end_date}
+    if account_uuid:
+        params["accountid"] = account_uuid
+    resp = await client.businesses_get("reports/general_ledger", params)
+    return _fmt(_unwrap_report(resp, "general_ledger"))
+
+
+@mcp.tool()
+@_handle_errors
+async def get_trial_balance(start_date: str, end_date: str) -> str:
+    """Get the Trial Balance report for a date range — every account's debit/credit totals, which must
+    balance. Useful to confirm the books tie out after posting reconciliation adjustments. Dates as YYYY-MM-DD."""
+    params = {"use_ledger_entries": "true", "start_date": start_date, "end_date": end_date}
+    resp = await client.businesses_get("reports/trial_balance", params)
+    return _fmt(_unwrap_report(resp, "trial_balance"))
+
+
+@mcp.tool()
+@_handle_errors
+async def list_journal_entries(page: int = 1, per_page: int = 25) -> str:
+    """List manual (adjustment) journal entries."""
+    resp = await client.businesses_get(
+        "journal_entries", {"page_number": page, "page_size": min(per_page, 100)},
+        api_version=client.JE_API_VERSION,
+    )
+    return _fmt(resp.get("manualJournalEntries", resp))
+
+
+@mcp.tool()
+@_handle_errors
+async def create_journal_entry(
+    name: str,
+    entries: list[dict],
+    date: str | None = None,
+    description: str | None = None,
+    number: str | None = None,
+) -> str:
+    """Post an adjusting (manual) journal entry — e.g. to record a bank fee, interest, or correct a
+    discrepancy found during reconciliation. `entries` is a list of lines, each
+    {"account_id": "<account uuid from list_ledger_accounts>", "amount": "12.34", "type": "debit"|"credit"}.
+    Total debits MUST equal total credits. `date` is YYYY-MM-DD (defaults to today)."""
+    payload = _build_manual_journal_entry(name, entries, date, description, number)
+    resp = await client.businesses_post("journal_entries", payload, api_version=client.JE_API_VERSION)
+    return _fmt(resp)
+
+
+@mcp.tool()
+@_handle_errors
+async def update_journal_entry(
+    journalentry_uuid: str,
+    name: str,
+    entries: list[dict],
+    date: str | None = None,
+    description: str | None = None,
+    number: str | None = None,
+) -> str:
+    """Update an existing manual journal entry (by uuid). Same line/balance rules as create_journal_entry."""
+    payload = _build_manual_journal_entry(name, entries, date, description, number, entry_id=journalentry_uuid)
+    resp = await client.businesses_put(
+        f"journal_entries/{journalentry_uuid}", payload, api_version=client.JE_API_VERSION
+    )
+    return _fmt(resp)
+
+
+# ─── Other Income (deposits not tied to an invoice) ───
+
+@mcp.tool()
+@_handle_errors
+async def list_other_income(page: int = 1, per_page: int = 25) -> str:
+    """List Other Income records — money in that isn't an invoice payment (interest, cash sales,
+    refunds received). These show up as unexplained bank credits during reconciliation."""
+    result = await client.accounting_list("other_incomes/other_incomes", page, per_page)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_other_income(income_id: int) -> str:
+    """Get a single Other Income record."""
+    result = await client.accounting_get("other_incomes/other_incomes", income_id)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def create_other_income(other_income: dict) -> str:
+    """Create an Other Income record. Pass the FreshBooks other_income fields (e.g. amount, date,
+    category_name, payment_type, note)."""
+    result = await client.accounting_create("other_incomes/other_incomes", "other_income", other_income)
+    return _fmt(result)
+
+
+# ─── Bills / Bill Payments / Vendors (Accounts Payable — money out) ───
+
+@mcp.tool()
+@_handle_errors
+async def list_bills(page: int = 1, per_page: int = 25) -> str:
+    """List Bills (accounts payable). Match bank debits to vendor bills you've paid."""
+    result = await client.accounting_list("bills/bills", page, per_page)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_bill(bill_id: int) -> str:
+    """Get a single Bill."""
+    result = await client.accounting_get("bills/bills", bill_id)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def create_bill(bill: dict) -> str:
+    """Create a Bill. Requires a vendorid (see list_vendors / create_vendor). Pass FreshBooks bill
+    fields (e.g. vendorid, issue_date, due_offset_days, lines)."""
+    result = await client.accounting_create("bills/bills", "bill", bill)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def list_bill_payments(page: int = 1, per_page: int = 25) -> str:
+    """List Bill Payments — records of payments made against Bills (the cash-out side of AP). (beta endpoint)"""
+    result = await client.accounting_list("bill_payments/bill_payments", page, per_page)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_bill_payment(bill_payment_id: int) -> str:
+    """Get a single Bill Payment."""
+    result = await client.accounting_get("bill_payments/bill_payments", bill_payment_id)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def create_bill_payment(bill_payment: dict) -> str:
+    """Record a payment against a Bill. Pass FreshBooks bill_payment fields (e.g. billid, amount,
+    payment_type, paid_date)."""
+    result = await client.accounting_create("bill_payments/bill_payments", "bill_payment", bill_payment)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def list_vendors(page: int = 1, per_page: int = 25) -> str:
+    """List Vendors (the businesses you pay via Bills). (beta endpoint)"""
+    result = await client.accounting_list("bill_vendors/bill_vendors", page, per_page)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_vendor(vendor_id: int) -> str:
+    """Get a single Vendor."""
+    result = await client.accounting_get("bill_vendors/bill_vendors", vendor_id)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def create_vendor(vendor: dict) -> str:
+    """Create a Vendor. Pass FreshBooks vendor fields (e.g. vendor_name, account_number, primary_contact_email)."""
+    result = await client.accounting_create("bill_vendors/bill_vendors", "vendor", vendor)
+    return _fmt(result)
+
+
+# ─── Credit Notes (client credits / prepayments / overpayments) ───
+
+@mcp.tool()
+@_handle_errors
+async def list_credit_notes(page: int = 1, per_page: int = 25) -> str:
+    """List Credit Notes — client credits, prepayments and overpayments applied to invoices. Affects AR
+    balances you'd reconcile."""
+    result = await client.accounting_list("credit_notes/credit_notes", page, per_page)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def get_credit_note(credit_id: int) -> str:
+    """Get a single Credit Note."""
+    result = await client.accounting_get("credit_notes/credit_notes", credit_id)
+    return _fmt(result)
+
+
+@mcp.tool()
+@_handle_errors
+async def create_credit_note(credit_note: dict) -> str:
+    """Create a Credit Note. Pass FreshBooks credit_note fields (e.g. customerid, create_date, lines)."""
+    result = await client.accounting_create("credit_notes/credit_notes", "credit_note", credit_note)
+    return _fmt(result)
 
 
 # ─── Helpers ───

@@ -9,6 +9,10 @@ from .auth import get_config, get_valid_token, get_identity
 ACCOUNTING_BASE = "https://api.freshbooks.com/accounting/account"
 PROJECTS_BASE = "https://api.freshbooks.com/projects/business"
 UPLOADS_BASE = "https://api.freshbooks.com/uploads/account"
+# Newer accounting API, keyed by business_uuid (journal entries, ledger accounts,
+# general ledger / trial balance / account-entry-details reports).
+BUSINESSES_BASE = "https://api.freshbooks.com/accounting/businesses"
+JE_API_VERSION = "2023-09-25"  # required x-api-version for journal_entries CRUD
 
 _identity_cache: dict | None = None
 
@@ -32,6 +36,18 @@ async def get_ids() -> tuple[str, str]:
     return _identity_cache["account_id"], _identity_cache["business_id"]
 
 
+async def get_business_uuid() -> str:
+    """Get the business_uuid (for the newer /accounting/businesses API), cached."""
+    await get_ids()  # ensures _identity_cache is populated
+    uuid = (_identity_cache or {}).get("business_uuid")
+    if not uuid:
+        raise ValueError(
+            "business_uuid not available on this account's identity. "
+            "Re-run freshbooks_authenticate to refresh identity."
+        )
+    return uuid
+
+
 async def whoami() -> dict:
     """Get current user identity."""
     global _identity_cache
@@ -39,6 +55,45 @@ async def whoami() -> dict:
     token = get_valid_token(config)
     _identity_cache = get_identity(token)
     return _identity_cache
+
+
+async def businesses_request(
+    method: str,
+    path: str,
+    *,
+    params: dict | None = None,
+    json_body: dict | None = None,
+    api_version: str | None = None,
+) -> dict:
+    """Call the newer /accounting/businesses/<business_uuid>/<path> API.
+
+    Returns the raw decoded JSON — callers unwrap, since these endpoints differ:
+    reports nest under response.result.<key>, while journal_entries / ledger_accounts
+    return their payload at the top level.
+    """
+    business_uuid = await get_business_uuid()
+    url = f"{BUSINESSES_BASE}/{business_uuid}/{path}"
+    headers = await _get_headers()
+    if api_version:
+        headers["x-api-version"] = api_version
+    async with httpx.AsyncClient() as http:
+        resp = await http.request(
+            method, url, headers=headers, params=params or {}, json=json_body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def businesses_get(path: str, params: dict | None = None, api_version: str | None = None) -> dict:
+    return await businesses_request("GET", path, params=params, api_version=api_version)
+
+
+async def businesses_post(path: str, json_body: dict, api_version: str | None = None) -> dict:
+    return await businesses_request("POST", path, json_body=json_body, api_version=api_version)
+
+
+async def businesses_put(path: str, json_body: dict, api_version: str | None = None) -> dict:
+    return await businesses_request("PUT", path, json_body=json_body, api_version=api_version)
 
 
 def _build_search_params(filters: dict | None) -> dict:

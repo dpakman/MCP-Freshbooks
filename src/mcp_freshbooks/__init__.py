@@ -1,3 +1,3 @@
-"""MCP server for FreshBooks — 53 tools for invoices, clients, expenses, payments, time tracking, projects, estimates, reports, and smart workflows."""
+"""MCP server for FreshBooks — invoices, clients, expenses, payments, time tracking, projects, estimates, reports, bank reconciliation (journal entries, ledger accounts, general ledger, trial balance), accounts payable (bills, vendors), other income, credit notes, and smart workflows."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.2"
